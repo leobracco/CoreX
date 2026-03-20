@@ -1,0 +1,17 @@
+{
+  "name": "corex",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "bridge_aog.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@turf/turf": "^7.3.4",
+    "axios": "^1.13.6",
+    "mqtt": "^5.15.0"
+  }
+}
