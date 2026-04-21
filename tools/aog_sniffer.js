@@ -22,6 +22,12 @@
 // ============================================================
 
 const dgram = require('dgram');
+const {
+  encode: buildPGN,
+  isValidPGN,
+  validateCRC,
+  PGN_NAMES: PGN_NAMES_BASE,
+} = require('../src/protocol');
 
 const C = {
   r:   '\x1b[0m',
@@ -35,26 +41,8 @@ const C = {
   bld: '\x1b[1m',
 };
 
-const PGN_NAMES = {
-  100: 'Position GPS',
-  202: 'Scan Request',
-  203: 'Subnet Reply',
-  211: 'From IMU',
-  214: 'Main Antenna GPS',
-  221: 'Hardware Message',
-  222: 'Nudge by Machine',
-  229: '64 Sections State',
-  235: 'Section Dimensions',
-  236: 'Pin Config',
-  237: 'From Machine ⭐',
-  238: 'Machine Config',
-  239: 'Machine Data',
-  250: 'From Autosteer 2',
-  251: 'Steer Config',
-  252: 'Steer Settings',
-  253: 'From Autosteer',
-  254: 'Steer Data',
-};
+// Overlay local: en este tool marcamos 237 con ⭐ para hacerlo visible
+const PGN_NAMES = { ...PGN_NAMES_BASE, 237: 'From Machine ⭐' };
 
 function ts() {
   return new Date().toISOString().substr(11, 12);
@@ -65,32 +53,6 @@ function hex(buf, max = 32) {
     .map(b => b.toString(16).padStart(2, '0'))
     .join(' ');
   return buf.length > max ? bytes + ` ... (+${buf.length - max})` : bytes;
-}
-
-function isValidPGN(msg) {
-  return msg.length >= 5 && msg[0] === 0x80 && msg[1] === 0x81;
-}
-
-function validateCRC(msg) {
-  if (msg.length < 6) return false;
-  let sum = 0;
-  for (let i = 2; i < msg.length - 1; i++) sum = (sum + msg[i]) & 0xFF;
-  return sum === msg[msg.length - 1];
-}
-
-function buildPGN(src, pgn, data) {
-  const len = data.length;
-  const msg = Buffer.alloc(5 + len + 1);
-  msg[0] = 0x80;
-  msg[1] = 0x81;
-  msg[2] = src;
-  msg[3] = pgn;
-  msg[4] = len;
-  data.copy(msg, 5);
-  let crc = 0;
-  for (let i = 2; i < msg.length - 1; i++) crc = (crc + msg[i]) & 0xFF;
-  msg[msg.length - 1] = crc;
-  return msg;
 }
 
 function decodePGN(msg) {

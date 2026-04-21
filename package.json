@@ -1,13 +1,17 @@
 {
   "name": "corex",
   "version": "1.0.0",
-  "description": "",
+  "description": "Bridge Node.js entre AgOpenGPS y el ecosistema AgroParallel (VistaX, FlowX, QuantiX)",
   "license": "ISC",
   "author": "",
   "type": "commonjs",
-  "main": "bridge_aog.js",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@turf/turf": "^7.3.4",

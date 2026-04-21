@@ -22,24 +22,11 @@
 // ============================================================
 
 const dgram = require('dgram');
+const { encode, SRC, PGN, SWITCH } = require('../src/protocol');
 
 const ip    = process.argv[2] || '127.0.0.1';
 const port  = parseInt(process.argv[3]) || 15555;
 const work  = parseInt(process.argv[4]) || 0;
-
-function buildPGN(src, pgn, data) {
-    const msg = Buffer.alloc(5 + data.length + 1);
-    msg[0] = 0x80;
-    msg[1] = 0x81;
-    msg[2] = src;
-    msg[3] = pgn;
-    msg[4] = data.length;
-    data.copy(msg, 5);
-    let crc = 0;
-    for (let i = 2; i < msg.length - 1; i++) crc = (crc + msg[i]) & 0xFF;
-    msg[msg.length - 1] = crc;
-    return msg;
-}
 
 // Payload idéntico al que captura el pcap, salvo el byte Switch
 // 4b 01 = steerAngle 0x014B = 331 = 3.31°
@@ -47,15 +34,16 @@ function buildPGN(src, pgn, data) {
 // b8 22 = roll       0x22B8 = 8888
 // [switch]
 // 2c = PWM 44
+const switchByte = work ? (SWITCH.MAIN | SWITCH.WORK) : SWITCH.MAIN;
 const payload = Buffer.from([
-    0x4B, 0x01,              // steerAngle
-    0x0F, 0x27,              // heading
-    0xB8, 0x22,              // roll
-    work ? 0x05 : 0x04,      // switch (bit 2 mainSwitch + opcional bit 0 work)
-    0x2C                     // pwmDisplay
+    0x4B, 0x01,    // steerAngle
+    0x0F, 0x27,    // heading
+    0xB8, 0x22,    // roll
+    switchByte,    // switch (bit 2 mainSwitch + opcional bit 0 work)
+    0x2C           // pwmDisplay
 ]);
 
-const packet = buildPGN(0x7E, 0xFD, payload);
+const packet = encode(SRC.AUTOSTEER, PGN.FROM_STEER, payload);
 
 console.log('╔════════════════════════════════════════════════╗');
 console.log('║    Test PGN 253 — From AutoSteer                ║');

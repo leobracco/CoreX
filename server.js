@@ -10,6 +10,9 @@ require("dotenv").config();
 // ── CoreX: fuente de verdad para campo activo de AgOpenGPS ──
 const aogLogWatcher = require("./core/logic/aog_log_watcher");
 
+// ── Protocolo AgOpenGPS (encode/decode/CRC/constantes) ──
+const protocol = require("./src/protocol");
+
 // ============================================================
 // DEBUG — 3 niveles
 // ============================================================
@@ -52,14 +55,14 @@ const VEL_MIN_PINTADO  = parseFloat(process.env.VEL_MIN_PINTADO) || 0.5;
 //   - El byte Switch: bit 0=work, bit 1=steer, bit 2=mainSwitch (SIEMPRE 1)
 const AOG_BROADCAST_IP = process.env.AOG_BROADCAST_IP || "127.0.0.1";
 const AOG_PORT_OUT     = parseInt(process.env.AOG_PORT_OUT) || 17777;
-const PGN_FROM_STEER   = 0xFD; // 253
-const SRC_AUTOSTEER    = 0x7E; // 126
+const PGN_FROM_STEER   = protocol.PGN.FROM_STEER; // 253 (0xFD)
+const SRC_AUTOSTEER    = protocol.SRC.AUTOSTEER;  // 126 (0x7E)
 
 // Estado persistente del PGN 253 (8 bytes)
 // Formato del payload: [steerAngleLo][steerAngleHi][hdgLo][hdgHi][rollLo][rollHi][Switch][PWM]
 // Inicializamos con mainSwitch=1 (bit 2), todo el resto en 0
 const pgn253State = Buffer.alloc(8, 0);
-pgn253State[6] = 0b00000100; // mainSwitch ON, work OFF, steer OFF
+pgn253State[6] = protocol.SWITCH.MAIN; // mainSwitch ON, work OFF, steer OFF
 
 dbg(1, 'INIT', `MQTT: ${process.env.MQTT_BROKER || "mqtt://127.0.0.1"} | UDP: ${UDP_PORT} | Debug: nivel ${DBG_LEVEL}`);
 
@@ -134,9 +137,14 @@ function cargarMapa() {
 }
 
 fs.watchFile(MAPA_PATH, () => cargarMapa());
-setInterval(sincronizarConfig, 30000);
+const configTimer = setInterval(sincronizarConfig, 30000);
 sincronizarConfig();
 cargarMapa();
+
+// Timers creados dentro de mqttClient.on("connect"); referenciados en shutdown
+let pgn253Timer    = null;
+let syncTimeTimer  = null;
+let fieldStatusTimer = null;
 
 // ============================================================
 // 2. ESTADO DE PINTADO
@@ -157,7 +165,7 @@ function actualizarEstadoPintado(secciones) {
     }));
 }
 
-setInterval(() => {
+fieldStatusTimer = setInterval(() => {
     if (!mqttClient.connected) return;
     const payload = {
         painting:  aogPainting,
@@ -180,7 +188,7 @@ mqttClient.on("connect", () => {
 
     aogLogWatcher.iniciar(mqttClient);
 
-    setInterval(() => {
+    syncTimeTimer = setInterval(() => {
         if (latitud === 0 && longitud === 0) return;
         mqttClient.publish("vistax/sync/time", JSON.stringify({
             gps_ts: Date.now(),
@@ -193,9 +201,7 @@ mqttClient.on("connect", () => {
     // ⭐ IMPORTANTE: AOG espera un stream constante del AutoSteer, no solo cambios.
     // Si solo mandamos en el cambio de estado, AOG marca el módulo como desconectado
     // y puede ignorar el workSwitch. Por eso emitimos PGN 253 cada 200ms.
-    setInterval(() => {
-        enviarPGN253();
-    }, 200);
+    pgn253Timer = setInterval(enviarPGN253, 200);
 });
 
 mqttClient.on("message", (topic, message) => {
@@ -316,37 +322,12 @@ function ejecutarCalculosModulares() {
 // 4.b ENVÍO DE PGN 253 HACIA AOG (work switch + heartbeat)
 // ============================================================
 /**
- * Construye un paquete PGN con el formato estándar de AgOpenGPS:
- * [0x80][0x81][Src][PGN][Len][...Data...][CRC]
- * CRC = (suma de bytes desde índice 2 hasta n-2) & 0xFF
- */
-function buildPGN(src, pgn, data) {
-    const len = data.length;
-    const msg = Buffer.alloc(5 + len + 1);
-
-    msg[0] = 0x80;
-    msg[1] = 0x81;
-    msg[2] = src;
-    msg[3] = pgn;
-    msg[4] = len;
-    data.copy(msg, 5);
-
-    let crc = 0;
-    for (let i = 2; i < msg.length - 1; i++) {
-        crc = (crc + msg[i]) & 0xFF;
-    }
-    msg[msg.length - 1] = crc;
-
-    return msg;
-}
-
-/**
  * Envía el estado actual del PGN 253 (From AutoSteer) hacia AOG.
  * Se llama tanto cuando cambia el work switch como periódicamente
  * (cada 200ms) desde el interval del mqttClient.on("connect").
  */
 function enviarPGN253() {
-    const packet = buildPGN(SRC_AUTOSTEER, PGN_FROM_STEER, pgn253State);
+    const packet = protocol.encode(SRC_AUTOSTEER, PGN_FROM_STEER, pgn253State);
 
     udpSocket.send(packet, AOG_PORT_OUT, AOG_BROADCAST_IP, (err) => {
         if (err) {
@@ -365,10 +346,8 @@ function enviarPGN253() {
  *   bit 2 = mainSwitch  (SIEMPRE 1 o AOG descarta)
  */
 function setWorkSwitch(isDown) {
-   pgn253State[6] = 0x04;  // solo mainSwitch
-    if (isDown) {
-        pgn253State[6] |= 0x01;  // agregar work
-    }
+    pgn253State[6] = protocol.SWITCH.MAIN;   // reset: solo mainSwitch
+    if (isDown) pgn253State[6] |= protocol.SWITCH.WORK;
 
     enviarPGN253();
     console.log(`${C.mag}▸ [AOG-OUT]${C.r} 🔧 workSwitch=${isDown ? 'DOWN ⬇' : 'UP ⬆'} | byte=0x${pgn253State[6].toString(16).padStart(2,'0')} (${pgn253State[6].toString(2).padStart(8,'0')})`);
@@ -567,3 +546,47 @@ udpSocket.bind(UDP_PORT, () => {
     dbg(1, 'INIT', `AOG output → ${AOG_BROADCAST_IP}:${AOG_PORT_OUT} (PGN 253)`);
     dbg(1, 'INIT', `Cambiar nivel: mosquitto_pub -t corex/debug/level -m 2`);
 });
+
+// ============================================================
+// 8. GRACEFUL SHUTDOWN
+// ============================================================
+// PM2 manda SIGINT y tras 1.6s SIGKILL. Cerramos recursos a tiempo:
+//  - detenemos timers (heartbeat PGN 253, sync, config, field status)
+//  - cerramos socket UDP
+//  - desconectamos MQTT con flush
+//  - detenemos field watcher (intervals + fs.watchFile)
+let _shuttingDown = false;
+function shutdown(signal) {
+    if (_shuttingDown) return;
+    _shuttingDown = true;
+    dbg(1, 'SHUTDOWN', `Señal ${signal} recibida — cerrando recursos...`);
+
+    try { clearInterval(pgn253Timer);    } catch (_) {}
+    try { clearInterval(syncTimeTimer);  } catch (_) {}
+    try { clearInterval(configTimer);    } catch (_) {}
+    try { clearInterval(fieldStatusTimer); } catch (_) {}
+
+    try {
+        if (aogLogWatcher && typeof aogLogWatcher.detener === 'function') {
+            aogLogWatcher.detener();
+        }
+    } catch (e) { dbgErr('SHUTDOWN', `watcher: ${e.message}`); }
+
+    try { udpSocket.close(); } catch (e) { dbgErr('SHUTDOWN', `udp: ${e.message}`); }
+
+    try {
+        mqttClient.end(false, {}, () => {
+            dbg(1, 'SHUTDOWN', '✓ Cerrado limpio');
+            process.exit(0);
+        });
+    } catch (e) {
+        dbgErr('SHUTDOWN', `mqtt: ${e.message}`);
+        process.exit(1);
+    }
+
+    // Fallback si MQTT no responde a tiempo
+    setTimeout(() => process.exit(0), 1500).unref();
+}
+
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
