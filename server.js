@@ -7,6 +7,31 @@ const axios = require("axios");
 const os    = require("os");
 require("dotenv").config();
 
+// ── CoreX: fuente de verdad para campo activo de AgOpenGPS ──
+const aogLogWatcher = require("./core/logic/aog_log_watcher");
+
+// ============================================================
+// DEBUG — 3 niveles
+// ============================================================
+let DBG_LEVEL = parseInt(process.env.DEBUG_LEVEL) || 1;
+const C = { r:'\x1b[0m', red:'\x1b[31m', grn:'\x1b[32m', yel:'\x1b[33m', cyn:'\x1b[36m', mag:'\x1b[35m', gry:'\x1b[90m' };
+
+function dbg(level, tag, msg, data) {
+  if (level > DBG_LEVEL) return;
+  const ts = new Date().toISOString().substr(11, 12);
+  const lbl = ['','▸','▸▸','▸▸▸'][level] || '▸';
+  const clr = [C.r, C.grn, C.cyn, C.gry][level] || C.r;
+  let line = `${C.gry}${ts}${C.r} ${clr}${lbl} [${tag}]${C.r} ${msg}`;
+  if (data !== undefined && DBG_LEVEL >= 3) line += ` ${C.gry}${typeof data === 'object' ? JSON.stringify(data) : data}${C.r}`;
+  console.log(line);
+}
+function dbgErr(tag, msg) { console.error(`${C.red}✖ [${tag}]${C.r} ${msg}`); }
+
+let _udpCount = 0;
+let _gpsCount = 0;
+let _velCount = 0;
+let _secCount = 0;
+
 const udpSocket  = dgram.createSocket("udp4");
 const mqttClient = mqtt.connect(process.env.MQTT_BROKER || "mqtt://127.0.0.1");
 
@@ -18,17 +43,25 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 const MAPA_PATH        = path.join(DATA_DIR, "ultimo_mapa.json");
 const FLOW_CONFIG_PATH = path.join(DATA_DIR, "flowx_config.json");
 const CONFIG_URL       = process.env.CONFIG_URL || "http://localhost:8080/api/gis/config-implemento";
+const VEL_MIN_PINTADO  = parseFloat(process.env.VEL_MIN_PINTADO) || 0.5;
 
-// Ruta campos AOG: primero .env, si está vacío → Documents del usuario
-const AOG_FIELDS_PATH = process.env.AOG_FIELDS_PATH
-  ? path.normalize(process.env.AOG_FIELDS_PATH)
-  : path.join(os.homedir(), "Documents", "AgOpenGPS", "Fields");
+// ── Envío hacia AgOpenGPS (PGN 253 - From AutoSteer) ──
+// Confirmado por pcap del emulador real:
+//   - El work switch va en el byte "Switch" del PGN 253 (NO en PGN 237)
+//   - AOG escucha en :17777 (loopback) y :8888 (LAN)
+//   - El byte Switch: bit 0=work, bit 1=steer, bit 2=mainSwitch (SIEMPRE 1)
+const AOG_BROADCAST_IP = process.env.AOG_BROADCAST_IP || "127.0.0.1";
+const AOG_PORT_OUT     = parseInt(process.env.AOG_PORT_OUT) || 17777;
+const PGN_FROM_STEER   = 0xFD; // 253
+const SRC_AUTOSTEER    = 0x7E; // 126
 
-// Umbral de velocidad para considerar pintado activo
-const VEL_MIN_PINTADO = parseFloat(process.env.VEL_MIN_PINTADO) || 0.5;
+// Estado persistente del PGN 253 (8 bytes)
+// Formato del payload: [steerAngleLo][steerAngleHi][hdgLo][hdgHi][rollLo][rollHi][Switch][PWM]
+// Inicializamos con mainSwitch=1 (bit 2), todo el resto en 0
+const pgn253State = Buffer.alloc(8, 0);
+pgn253State[6] = 0b00000100; // mainSwitch ON, work OFF, steer OFF
 
-console.log(`\x1b[36m[CoreX]\x1b[0m Campos AOG: ${AOG_FIELDS_PATH}`);
-console.log(`\x1b[36m[CoreX]\x1b[0m MQTT: ${process.env.MQTT_BROKER || "mqtt://127.0.0.1"}`);
+dbg(1, 'INIT', `MQTT: ${process.env.MQTT_BROKER || "mqtt://127.0.0.1"} | UDP: ${UDP_PORT} | Debug: nivel ${DBG_LEVEL}`);
 
 // --- ESTADO GLOBAL ---
 let mapaPrescripcion = null;
@@ -53,8 +86,9 @@ let flowConfig = {
 if (fs.existsSync(FLOW_CONFIG_PATH)) {
     try {
         flowConfig = { ...flowConfig, ...JSON.parse(fs.readFileSync(FLOW_CONFIG_PATH)) };
+        dbg(2, 'INIT', 'flowx_config.json cargado');
     } catch (e) {
-        console.error("❌ Bridge: Error cargando flowx_config.json");
+        dbgErr('INIT', 'Error cargando flowx_config.json');
     }
 }
 
@@ -67,16 +101,13 @@ let lastTimestamp         = Date.now();
 
 // --- TRACKING DE HEADING ---
 let posicionesHistorial = [];
-const MAX_HISTORIAL = 5;
-let ultimaPosicion  = null;
+const MAX_HISTORIAL  = 5;
+let ultimaPosicion   = null;
 let headingSuavizado = 0;
-let ultimoTiempo    = Date.now();
+let ultimoTiempo     = Date.now();
 
-// --- ESTADO CAMPO AOG ---
-let aogField = {
-  nombre:   "",
-  painting: false,
-};
+// --- ESTADO PINTADO ---
+let aogPainting = false;
 
 // ============================================================
 // 1. SINCRONIZACIÓN Y ARCHIVOS
@@ -85,9 +116,9 @@ async function sincronizarConfig() {
     try {
         const res = await axios.get(CONFIG_URL);
         configImplemento = { ...configImplemento, ...res.data };
-        console.log("⚙️ Bridge: Config sincronizada con QuantiX API");
+        dbg(2, 'SYNC', 'Config sincronizada con QuantiX API');
     } catch (e) {
-        console.error("❌ Bridge: Esperando API de QuantiX...");
+        dbg(2, 'SYNC', 'Esperando API de QuantiX...');
     }
 }
 
@@ -95,9 +126,9 @@ function cargarMapa() {
     if (fs.existsSync(MAPA_PATH)) {
         try {
             mapaPrescripcion = JSON.parse(fs.readFileSync(MAPA_PATH));
-            console.log("🗺️ Bridge: Mapa VRA cargado");
+            dbg(1, 'VRA', 'Mapa prescripción cargado');
         } catch (e) {
-            console.error("❌ Error leyendo mapa");
+            dbgErr('VRA', 'Error leyendo mapa');
         }
     }
 }
@@ -108,151 +139,46 @@ sincronizarConfig();
 cargarMapa();
 
 // ============================================================
-// 2. WATCHER CAMPOS AOG
+// 2. ESTADO DE PINTADO
 // ============================================================
-// "2026-03-23 18-35", "2026-01-27 11-40", etc.
-// AOG los genera como: YYYY-MM-DD HH-mm
-const AOG_NOMBRE_AUTO = /^\d{4}-\d{2}-\d{2} \d{2}-\d{2}$/;
-
-/**
- * Devuelve true si el nombre de carpeta fue generado
- * automáticamente por AOG (no tiene nombre de campo real).
- */
-function esCarpetaAuto(nombre) {
-  return AOG_NOMBRE_AUTO.test(nombre.trim());
-}
-
-/**
- * De la lista de subcarpetas con Field.txt, devuelve la más
- * reciente que tenga nombre real (no auto-generado por AOG).
- * Si no hay ninguna con nombre real, cae al más reciente de todos.
- */
-function elegirCampoActivo(subdirs) {
-  if (!subdirs.length) return null;
-
-  // Primero buscar entre los campos con nombre real
-  const conNombre = subdirs.filter(d => !esCarpetaAuto(d.name));
-  if (conNombre.length) {
-    conNombre.sort((a, b) => b.mtime - a.mtime);
-    return conNombre[0].name;
-  }
-
-  // Fallback: tomar el más reciente aunque sea auto-generado
-  subdirs.sort((a, b) => b.mtime - a.mtime);
-  return subdirs[0].name;
-}
-
-function iniciarWatcherCampos() {
-  if (!fs.existsSync(AOG_FIELDS_PATH)) {
-    console.log(`\x1b[33m[FieldWatcher]\x1b[0m Carpeta no encontrada: ${AOG_FIELDS_PATH}`);
-    console.log("[FieldWatcher] Reintentando en 30s...");
-    setTimeout(iniciarWatcherCampos, 30000);
-    return;
-  }
-
-  detectarCampoActual();
-
-  try {
-    // AOG toca distintos archivos según la acción:
-    //   Field.txt   → campo nuevo creado desde cero
-    //   Field.kml   → campo existente abierto (con boundary)
-    //   agshare.txt → campo abierto (siempre)
-    //   Boundary.txt → boundary cargado
-    // Escuchamos todos para no perder ningún caso.
-    const ARCHIVOS_AOG = new Set(["Field.txt", "Field.kml", "agshare.txt", "Boundary.txt"]);
-
-    fs.watch(AOG_FIELDS_PATH, { recursive: true }, (event, filename) => {
-      if (!filename) return;
-      if (!ARCHIVOS_AOG.has(path.basename(filename))) return;
-
-      const fieldName = filename.split(/[\\/]/)[0];
-      if (!fieldName) return;
-
-      // Ignorar carpetas auto-generadas por AOG
-      if (esCarpetaAuto(fieldName)) {
-        console.log(`\x1b[90m[FieldWatcher]\x1b[0m Ignorando carpeta auto: "${fieldName}"`);
-        return;
-      }
-
-      if (fieldName === aogField.nombre) return;
-
-      aogField.nombre = fieldName;
-      console.log(`\x1b[36m[FieldWatcher]\x1b[0m Campo detectado: "${fieldName}"`);
-      mqttClient.publish("aog/field/name", fieldName);
-      publicarEstadoCampo();
-    });
-
-    console.log(`\x1b[36m[FieldWatcher]\x1b[0m Vigilando: ${AOG_FIELDS_PATH}`);
-  } catch (err) {
-    console.log("[FieldWatcher] Modo polling cada 5s (Linux)");
-    setInterval(detectarCampoActual, 5000);
-  }
-}
-
-function detectarCampoActual() {
-  if (!fs.existsSync(AOG_FIELDS_PATH)) return;
-  try {
-    const subdirs = fs.readdirSync(AOG_FIELDS_PATH, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => {
-        // Prioridad: agshare.txt > Field.kml > Field.txt
-        // agshare.txt es el que AOG toca siempre al abrir un campo existente
-        for (const archivo of ["agshare.txt", "Field.kml", "Field.txt"]) {
-          const f = path.join(AOG_FIELDS_PATH, d.name, archivo);
-          if (fs.existsSync(f)) {
-            return { name: d.name, mtime: fs.statSync(f).mtimeMs };
-          }
-        }
-        return null;
-      })
-      .filter(Boolean);
-
-    if (!subdirs.length) return;
-
-    const campo = elegirCampoActivo(subdirs);
-    if (!campo || campo === aogField.nombre) return;
-
-    aogField.nombre = campo;
-    console.log(`\x1b[36m[FieldWatcher]\x1b[0m Campo activo: "${campo}"`);
-    mqttClient.publish("aog/field/name", campo);
-    publicarEstadoCampo();
-  } catch (err) {
-    console.error("[FieldWatcher] Error:", err.message);
-  }
-}
-
-
 function actualizarEstadoPintado(secciones) {
-  const nuevoPainting = secciones.some(s => s === 1) && velocidadActual > VEL_MIN_PINTADO;
-  if (nuevoPainting === aogField.painting) return;
+    const nuevoPainting = secciones.some(s => s === 1) && velocidadActual > VEL_MIN_PINTADO;
+    if (nuevoPainting === aogPainting) return;
 
-  aogField.painting = nuevoPainting;
-  const color = nuevoPainting ? "\x1b[32m" : "\x1b[33m";
-  console.log(`${color}[FieldWatcher]\x1b[0m Pintado ${nuevoPainting ? "INICIADO" : "DETENIDO"} — "${aogField.nombre}"`);
-  publicarEstadoCampo();
+    aogPainting = nuevoPainting;
+    const campoActual = aogLogWatcher.getCampoActual();
+    dbg(1, 'PAINT', `${nuevoPainting ? '▶ INICIADO' : '⏹ DETENIDO'} — "${campoActual}" | vel: ${velocidadActual.toFixed(1)}`);
+
+    if (!mqttClient.connected) return;
+    mqttClient.publish("aog/field/status", JSON.stringify({
+        painting:  aogPainting,
+        fieldName: campoActual,
+        ts:        Date.now(),
+    }));
 }
 
-function publicarEstadoCampo() {
-  if (!mqttClient.connected) return;
-  mqttClient.publish("aog/field/status", JSON.stringify({
-    painting:  aogField.painting,
-    fieldName: aogField.nombre,
-    ts:        Date.now(),
-  }));
-}
-
-// Heartbeat cada 3s para sincronizar reconexiones
-setInterval(() => { if (mqttClient.connected) publicarEstadoCampo(); }, 3000);
+setInterval(() => {
+    if (!mqttClient.connected) return;
+    const payload = {
+        painting:  aogPainting,
+        fieldName: aogLogWatcher.getCampoActual(),
+        ts:        Date.now(),
+    };
+    mqttClient.publish("aog/field/status", JSON.stringify(payload));
+    dbg(3, 'HEART', `painting:${aogPainting} field:"${payload.fieldName}"`);
+}, 3000);
 
 // ============================================================
 // 3. MQTT
 // ============================================================
 mqttClient.on("connect", () => {
-    console.log("🚀 CoreX Bridge: MQTT Conectado.");
+    dbg(1, 'MQTT', '🚀 Conectado al broker');
     mqttClient.subscribe("agp/flow/ui_cmd");
     mqttClient.subscribe("agp/flow/config_save");
+    mqttClient.subscribe("corex/debug/level");
+    mqttClient.subscribe("vistax/corex/aog/cmd");
 
-    iniciarWatcherCampos();
+    aogLogWatcher.iniciar(mqttClient);
 
     setInterval(() => {
         if (latitud === 0 && longitud === 0) return;
@@ -261,23 +187,58 @@ mqttClient.on("connect", () => {
             lat:    latitud,
             lon:    longitud,
         }));
+        dbg(3, 'SYNC', `time sync lat:${latitud.toFixed(6)} lon:${longitud.toFixed(6)}`);
     }, 1000);
+
+    // ⭐ IMPORTANTE: AOG espera un stream constante del AutoSteer, no solo cambios.
+    // Si solo mandamos en el cambio de estado, AOG marca el módulo como desconectado
+    // y puede ignorar el workSwitch. Por eso emitimos PGN 253 cada 200ms.
+    setInterval(() => {
+        enviarPGN253();
+    }, 200);
 });
 
 mqttClient.on("message", (topic, message) => {
     try {
+        if (topic === "corex/debug/level") {
+            const newLevel = parseInt(message.toString());
+            if (newLevel >= 0 && newLevel <= 3) {
+                DBG_LEVEL = newLevel;
+                console.log(`${C.yel}[DEBUG]${C.r} Nivel cambiado a ${DBG_LEVEL}`);
+            }
+            return;
+        }
+
+        if (topic === "vistax/corex/aog/cmd") {
+            const cmd = JSON.parse(message.toString());
+
+            switch (cmd.funcion) {
+                case "bajada_herramienta":
+                    setWorkSwitch(cmd.value === 1);
+                    dbg(2, 'AOG-CMD', `bajada_herramienta=${cmd.value} (origen: ${cmd.source?.uid || '?'}/c${cmd.source?.cable ?? '?'})`);
+                    break;
+
+                default:
+                    dbg(1, 'AOG-CMD', `⚠ Función no soportada: ${cmd.funcion}`);
+            }
+            return;
+        }
+
         const data = JSON.parse(message.toString());
+
         if (topic === "agp/flow/ui_cmd" && data.type === "SET_DOSIS") {
             flowConfig.dosisManual = data.valor;
             flowConfig.modoManual  = true;
             saveFlowConfig();
+            dbg(2, 'FLOW', `Dosis manual: ${data.valor}`);
         }
         if (topic === "agp/flow/config_save") {
             flowConfig = { ...flowConfig, ...data };
             saveFlowConfig();
+            dbg(2, 'FLOW', 'Config guardada');
         }
     } catch (e) {
-        console.error("❌ Bridge: Error MQTT", topic);
+        dbgErr('MQTT', `Error procesando ${topic}: ${e.message}`);
     }
 });
 
@@ -291,73 +252,46 @@ function saveFlowConfig() {
 // 4. MÓDULOS DE CÁLCULO
 // ============================================================
 function calcularYEnviarTargetFlow() {
-    if (!configImplemento?.anchos_secciones_cm?.length) return;
+    const anchoTotal = (configImplemento.anchos_secciones_cm || []).reduce((a, b) => a + b, 0) / 100;
+    if (anchoTotal <= 0) return;
 
-    let anchoActivoM = 0;
-    let seccionesByte = 0;
-    const maxAProcesar = Math.min(configImplemento.anchos_secciones_cm.length, 10);
-
-    for (let i = 0; i < maxAProcesar; i++) {
-        if (estadosSecciones[i] === 1) {
-            anchoActivoM += (configImplemento.anchos_secciones_cm[i] || 0) / 100;
-            seccionesByte |= 1 << i;
-        }
-    }
-
-    const dosisTarget = flowConfig.modoManual || !mapaPrescripcion
+    const dosisObjetivo = flowConfig.modoManual
         ? flowConfig.dosisManual
         : obtenerDosisMapa(latitud, longitud);
 
-    const lminTarget = velocidadActual > 0.5 && anchoActivoM > 0
-        ? (dosisTarget * velocidadActual * anchoActivoM) / 600
-        : 0;
+    const velMs = velocidadActual / 3.6;
+    const litrosPorMin = (dosisObjetivo * anchoTotal * velMs * 60) / 10000;
+    const pulsosPorSeg = litrosPorMin * flowConfig.meterCal / 60;
 
     mqttClient.publish("agp/flow/target", JSON.stringify({
-        target: parseFloat(lminTarget.toFixed(2)),
-        sec:    seccionesByte,
-        vel:    velocidadActual,
-        pwmMin: flowConfig.pwmMinimo,
-        pid:    flowConfig.pid,
+        pps_target: pulsosPorSeg.toFixed(2),
+        dosis:      dosisObjetivo,
+        vel:        velocidadActual.toFixed(1),
+        ts:         Date.now(),
     }));
 
-    mqttClient.publish("agp/flow/state", JSON.stringify({
-        dosisTarget,
-        velocidad:    velocidadActual,
-        caudalActual: 0,
-    }));
+    dbg(3, 'FLOW', `pps:${pulsosPorSeg.toFixed(2)} dosis:${dosisObjetivo} vel:${velocidadActual.toFixed(1)}`);
 }
 
-async function procesarDosisQuantiX(lat, lon) {
-    if (!configImplemento?.motores?.length) return;
+function procesarDosisQuantiX(lat, lon) {
+    const motores = configImplemento.motores || [];
+    if (motores.length === 0) return;
 
-    const dosisBase    = obtenerDosisMapa(lat, lon);
-    const m_s          = velocidadActual > 0.5 ? velocidadActual / 3.6 : 0;
-    const separacion_m = (configImplemento.implemento_activo?.geometria?.separacion_cm || 19) / 100;
+    const dosisObjetivo = obtenerDosisMapa(lat, lon);
+    const velMs = velocidadActual / 3.6;
 
-    configImplemento.motores.forEach((motor) => {
-        if (!motor.configuracion_secciones) return;
+    motores.forEach(motor => {
+        const anchoMotor = (motor.ancho_cm || 0) / 100;
+        const ppsTarget  = (dosisObjetivo * anchoMotor * velMs * (motor.cal || 1)) / 10000;
+        const motorDebeGirar = velMs > 0 && dosisObjetivo > 0 && aogPainting;
 
-        const motorDebeGirar = motor.configuracion_secciones.some((sec) => {
-            const idx = sec.seccion_aog - 1;
-            return sec.tipo === "trasero"
-                ? estadosSeccionesTren2[idx] === 1
-                : estadosSecciones[idx] === 1;
-        });
-
-        let ppsTarget = 0;
-        if (motorDebeGirar && dosisBase > 0 && m_s > 0) {
-            const cpReal      = parseFloat(motor.meter_cal) || 1.0;
-            const factorDosis = dosisBase > 500
-                ? (dosisBase * separacion_m) / 10000
-                : dosisBase;
-            ppsTarget = (factorDosis * m_s) / cpReal;
-        }
-
-        mqttClient.publish(`agp/quantix/${motor.uid_esp}/target`, JSON.stringify({
-            id:         motor.indice_interno,
-            pps:        parseFloat(ppsTarget.toFixed(2)),
-            seccion_on: motorDebeGirar,
+        mqttClient.publish(`agp/motor/${motor.uid_esp}/target`, JSON.stringify({
+            pps:  ppsTarget.toFixed(2),
+            on:   motorDebeGirar,
+            ts:   Date.now(),
         }));
+
+        dbg(3, 'QTX', `motor ${motor.uid_esp} pps:${ppsTarget.toFixed(2)} on:${motorDebeGirar}`);
     });
 }
 
@@ -379,15 +313,93 @@ function ejecutarCalculosModulares() {
 }
 
 // ============================================================
-// 5. EVENTOS UDP
+// 4.b ENVÍO DE PGN 253 HACIA AOG (work switch + heartbeat)
+// ============================================================
+/**
+ * Construye un paquete PGN con el formato estándar de AgOpenGPS:
+ * [0x80][0x81][Src][PGN][Len][...Data...][CRC]
+ * CRC = (suma de bytes desde índice 2 hasta n-2) & 0xFF
+ */
+function buildPGN(src, pgn, data) {
+    const len = data.length;
+    const msg = Buffer.alloc(5 + len + 1);
+
+    msg[0] = 0x80;
+    msg[1] = 0x81;
+    msg[2] = src;
+    msg[3] = pgn;
+    msg[4] = len;
+    data.copy(msg, 5);
+
+    let crc = 0;
+    for (let i = 2; i < msg.length - 1; i++) {
+        crc = (crc + msg[i]) & 0xFF;
+    }
+    msg[msg.length - 1] = crc;
+
+    return msg;
+}
+
+/**
+ * Envía el estado actual del PGN 253 (From AutoSteer) hacia AOG.
+ * Se llama tanto cuando cambia el work switch como periódicamente
+ * (cada 200ms) desde el interval del mqttClient.on("connect").
+ */
+function enviarPGN253() {
+    const packet = buildPGN(SRC_AUTOSTEER, PGN_FROM_STEER, pgn253State);
+
+    udpSocket.send(packet, AOG_PORT_OUT, AOG_BROADCAST_IP, (err) => {
+        if (err) {
+            dbgErr('AOG-OUT', `Error enviando PGN 253: ${err.message}`);
+            return;
+        }
+        dbg(3, 'AOG-OUT', `PGN 253 → ${AOG_BROADCAST_IP}:${AOG_PORT_OUT} | switchByte=0x${pgn253State[6].toString(16).padStart(2,'0')}`);
+    });
+}
+
+/**
+ * Setea el bit de work switch en el byte Switch del PGN 253.
+ * Byte Switch (índice 6 del payload):
+ *   bit 0 = workSwitch  (1 = herramienta abajo / trabajando)
+ *   bit 1 = steerSwitch (autosteer enable)
+ *   bit 2 = mainSwitch  (SIEMPRE 1 o AOG descarta)
+ */
+function setWorkSwitch(isDown) {
+   pgn253State[6] = 0x04;  // solo mainSwitch
+    if (isDown) {
+        pgn253State[6] |= 0x01;  // agregar work
+    }
+
+    enviarPGN253();
+    console.log(`${C.mag}▸ [AOG-OUT]${C.r} 🔧 workSwitch=${isDown ? 'DOWN ⬇' : 'UP ⬆'} | byte=0x${pgn253State[6].toString(16).padStart(2,'0')} (${pgn253State[6].toString(2).padStart(8,'0')})`);
+}
+
+// ============================================================
+// 5. EVENTOS UDP (recepción desde AOG)
 // ============================================================
 udpSocket.on("message", (msg) => {
     if (msg.length < 8) return;
     const pgn = msg[3];
 
+    _udpCount++;
+    dbg(3, 'UDP', `PGN ${pgn} | len:${msg.length} | #${_udpCount}`);
+
     if (pgn === 254) {
+        const velAnterior = velocidadActual;
         velocidadActual = msg.readInt16LE(5) / 10;
         mqttClient.publish("aog/machine/speed", velocidadActual.toFixed(1));
+
+        _velCount++;
+        if (Math.abs(velocidadActual - velAnterior) > 0.5) {
+            dbg(1, 'VEL', `${velocidadActual.toFixed(1)} km/h (era ${velAnterior.toFixed(1)})`);
+        }
+        else if (_velCount % 10 === 0) {
+            dbg(2, 'VEL', `${velocidadActual.toFixed(1)} km/h (pkt #${_velCount})`);
+        }
+        else {
+            dbg(3, 'VEL', `${velocidadActual.toFixed(1)} km/h`);
+        }
+
         ejecutarCalculosModulares();
     }
     else if (pgn === 100) {
@@ -401,6 +413,18 @@ udpSocket.on("message", (msg) => {
             heading: headingFinal,
             gps_ts:  Date.now(),
         }));
+
+        _gpsCount++;
+        if (_gpsCount % 50 === 0) {
+            dbg(1, 'GPS', `#${_gpsCount} lat:${latitud.toFixed(6)} lon:${longitud.toFixed(6)} hdg:${headingFinal.toFixed(1)}° vel:${velocidadActual.toFixed(1)}`);
+        }
+        else if (_gpsCount % 10 === 0) {
+            dbg(2, 'GPS', `#${_gpsCount} lat:${latitud.toFixed(6)} lon:${longitud.toFixed(6)} hdg:${headingFinal.toFixed(1)}°`);
+        }
+        else {
+            dbg(3, 'GPS', `lat:${latitud.toFixed(6)} lon:${longitud.toFixed(6)} hdg:${headingFinal.toFixed(1)}°`);
+        }
+
         ejecutarCalculosModulares();
     }
     else if (pgn === 235) {
@@ -417,6 +441,7 @@ udpSocket.on("message", (msg) => {
                     secciones_detectadas: cantidadSeccionesAOG,
                     anchos_detectados:    anchos_cm,
                 }), { retain: true });
+                dbg(1, 'SEC-CFG', `${cantidadSeccionesAOG} secciones detectadas | anchos: [${anchos_cm.join(',')}]cm`);
             }
         }
     }
@@ -462,6 +487,14 @@ function actualizarLogicaSecciones(seccionesActuales) {
         t1: estadosSecciones,
         t2: estadosSeccionesTren2,
     }));
+
+    _secCount++;
+    if (_secCount % 5 === 0) {
+        const t1on = estadosSecciones.filter(s => s === 1).length;
+        const t2on = estadosSeccionesTren2.filter(s => s === 1).length;
+        const fmtSec = arr => arr.slice(0, 16).map(v => v ? '█' : '·').join('');
+        dbg(2, 'SEC', `T1:[${fmtSec(estadosSecciones)}] (${t1on}) T2:[${fmtSec(estadosSeccionesTren2)}] (${t2on}) | dist:${distanciaAcumulada.toFixed(1)}m`);
+    }
 
     actualizarEstadoPintado(estadosSecciones);
     ejecutarCalculosModulares();
@@ -525,6 +558,12 @@ function calcularDistanciaMetros(lat1, lon1, lat2, lon2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-udpSocket.bind(UDP_PORT, () =>
-    console.log(`📡 CoreX Bridge activo en puerto ${UDP_PORT}`)
-);
+// ============================================================
+// 7. ARRANQUE
+// ============================================================
+udpSocket.bind(UDP_PORT, () => {
+    udpSocket.setBroadcast(true);
+    dbg(1, 'INIT', `📡 CoreX Bridge activo | UDP:${UDP_PORT} | Debug:${DBG_LEVEL}`);
+    dbg(1, 'INIT', `AOG output → ${AOG_BROADCAST_IP}:${AOG_PORT_OUT} (PGN 253)`);
+    dbg(1, 'INIT', `Cambiar nivel: mosquitto_pub -t corex/debug/level -m 2`);
+});
