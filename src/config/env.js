@@ -67,6 +67,11 @@ const config = {
     debug: {
         level:         envInt('DEBUG_LEVEL', 1),
         aogLogDebug:   envInt('AOGLOG_DEBUG', 1),
+        logFormat:     envStr('LOG_FORMAT', 'text'), // 'text' | 'json'
+    },
+
+    observability: {
+        port:          envInt('HEALTH_PORT', 9090),   // 0 para deshabilitar
     },
 };
 

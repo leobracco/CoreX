@@ -23,9 +23,17 @@ const protocol = require('../../protocol');
 const { createHeadingCalculator } = require('../../services/heading');
 const { createFieldWatcher } = require('../../services/field-watcher');
 
-function createAogModule({ mqtt, bus, state, logger, config, udp }) {
+function createAogModule({ mqtt, bus, state, logger, config, udp, metrics }) {
     const timers = [];
     const heading = createHeadingCalculator();
+
+    // Metrics (no-op si metrics no fue inyectado)
+    const mPgn253Sent   = metrics?.counter('corex_pgn253_sent_total', {}, 'PGN 253 heartbeats sent to AOG') ?? { inc: () => {} };
+    const mGpsUpdates   = metrics?.counter('corex_gps_updates_total', {}, 'GPS updates received') ?? { inc: () => {} };
+    const mSpeedKmh     = metrics?.gauge('corex_speed_kmh', {}, 'Current speed in km/h') ?? { set: () => {} };
+    const mHeadingDeg   = metrics?.gauge('corex_heading_deg', {}, 'Current smoothed heading in degrees') ?? { set: () => {} };
+    const mPainting     = metrics?.gauge('corex_painting', {}, 'Painting flag (1=trabajando, 0=detenido)') ?? { set: () => {} };
+    const mLastGpsTs    = metrics?.gauge('corex_last_gps_ts_seconds', {}, 'Unix timestamp of last GPS update') ?? { set: () => {} };
 
     // Payload persistente del PGN 253 (8 bytes)
     const pgn253 = Buffer.alloc(8, 0);
@@ -42,6 +50,7 @@ function createAogModule({ mqtt, bus, state, logger, config, udp }) {
         const packet = protocol.encode(protocol.SRC.AUTOSTEER, protocol.PGN.FROM_STEER, pgn253);
         udp.send(packet, config.udp.portOut, config.udp.broadcastIp, (err) => {
             if (err) return logger.err('AOG-OUT', `PGN 253: ${err.message}`);
+            mPgn253Sent.inc();
             logger.dbg(3, 'AOG-OUT', `PGN 253 → ${config.udp.broadcastIp}:${config.udp.portOut} | switch=0x${pgn253[6].toString(16).padStart(2,'0')}`);
         });
     }
@@ -72,6 +81,9 @@ function createAogModule({ mqtt, bus, state, logger, config, udp }) {
                 const hdg = heading.update(lat, lon, ts);
                 state.set('position', { lat, lon, ts });
                 state.set('heading', hdg);
+                mGpsUpdates.inc();
+                mLastGpsTs.set(Math.floor(ts / 1000));
+                mHeadingDeg.set(hdg);
 
                 mqtt.publish('aog/machine/position', JSON.stringify({
                     lat, lon, heading: hdg, gps_ts: ts,
@@ -92,6 +104,7 @@ function createAogModule({ mqtt, bus, state, logger, config, udp }) {
             bus.on('speed:update', ({ speed_kmh }) => {
                 const prev = state.get('speed_kmh');
                 state.set('speed_kmh', speed_kmh);
+                mSpeedKmh.set(speed_kmh);
                 mqtt.publish('aog/machine/speed', speed_kmh.toFixed(1));
 
                 velCount++;
@@ -131,7 +144,10 @@ function createAogModule({ mqtt, bus, state, logger, config, udp }) {
             });
 
             // --- Painting state sincronizado con field/status ---
-            bus.on('painting:changed', () => publishFieldStatus());
+            bus.on('painting:changed', ({ painting }) => {
+                mPainting.set(painting ? 1 : 0);
+                publishFieldStatus();
+            });
 
             // --- Heartbeat aog/field/status cada 3s ---
             timers.push(setInterval(() => {

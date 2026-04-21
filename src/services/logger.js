@@ -19,26 +19,51 @@ function ts() {
     return new Date().toISOString().substr(11, 12);
 }
 
-function createLogger(initialLevel = 1) {
+function createLogger(initialLevel = 1, { format = 'text' } = {}) {
     let level = Math.max(0, Math.min(3, initialLevel));
+    const isJson = format === 'json';
 
-    function dbg(lvl, tag, msg, data) {
-        if (lvl > level) return;
+    function emit(stream, lvlName, lvl, tag, msg, data) {
+        if (isJson) {
+            const rec = {
+                ts:     new Date().toISOString(),
+                level:  lvlName,
+                dbgLvl: lvl,
+                tag,
+                msg,
+            };
+            if (data !== undefined) rec.data = data;
+            stream(JSON.stringify(rec));
+            return;
+        }
         const lbl = LABELS[lvl] || '▸';
         const clr = COLORS[lvl] || C.r;
         let line = `${C.gry}${ts()}${C.r} ${clr}${lbl} [${tag}]${C.r} ${msg}`;
         if (data !== undefined && level >= 3) {
             line += ` ${C.gry}${typeof data === 'object' ? JSON.stringify(data) : data}${C.r}`;
         }
-        console.log(line);
+        stream(line);
+    }
+
+    function dbg(lvl, tag, msg, data) {
+        if (lvl > level) return;
+        emit(console.log, 'dbg', lvl, tag, msg, data);
     }
 
     function err(tag, msg) {
-        console.error(`${C.red}✖ [${tag}]${C.r} ${msg}`);
+        if (isJson) {
+            console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', tag, msg }));
+        } else {
+            console.error(`${C.red}✖ [${tag}]${C.r} ${msg}`);
+        }
     }
 
     function warn(tag, msg) {
-        console.warn(`${C.yel}⚠ [${tag}]${C.r} ${msg}`);
+        if (isJson) {
+            console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', tag, msg }));
+        } else {
+            console.warn(`${C.yel}⚠ [${tag}]${C.r} ${msg}`);
+        }
     }
 
     return {
@@ -50,11 +75,16 @@ function createLogger(initialLevel = 1) {
             const n = parseInt(newLvl);
             if (Number.isFinite(n) && n >= 0 && n <= 3) {
                 level = n;
-                console.log(`${C.yel}[DEBUG]${C.r} Nivel cambiado a ${level}`);
+                if (isJson) {
+                    console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', tag: 'DEBUG', msg: `Nivel cambiado a ${level}` }));
+                } else {
+                    console.log(`${C.yel}[DEBUG]${C.r} Nivel cambiado a ${level}`);
+                }
                 return true;
             }
             return false;
         },
+        isJson: () => isJson,
         C,
     };
 }

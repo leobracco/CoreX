@@ -11,16 +11,24 @@
 const dgram = require('dgram');
 const protocol = require('../protocol');
 
-function createUdpTransport({ port, bus, logger }) {
+function createUdpTransport({ port, bus, logger, metrics }) {
     const socket = dgram.createSocket('udp4');
     let frameCount = 0;
 
+    // Metrics (no-op si metrics no fue inyectado)
+    const mTotal   = metrics?.counter('corex_udp_frames_total', {}, 'UDP frames received') ?? { inc: () => {} };
+    const mByPgn   = (pgn) => metrics?.counter('corex_udp_frames_by_pgn_total', { pgn: String(pgn) }, 'UDP frames by PGN') ?? { inc: () => {} };
+    const mInvalid = metrics?.counter('corex_udp_invalid_total', {}, 'UDP frames with invalid header/len/CRC') ?? { inc: () => {} };
+
     socket.on('message', (msg) => {
-        if (msg.length < protocol.MIN_FRAME_LEN) return;
+        if (msg.length < protocol.MIN_FRAME_LEN) { mInvalid.inc(); return; }
         const frame = protocol.decode(msg);
-        if (!frame) return;
+        if (!frame) { mInvalid.inc(); return; }
+        if (!frame.crcValid) mInvalid.inc();
 
         frameCount++;
+        mTotal.inc();
+        mByPgn(frame.pgn).inc();
         logger.dbg(3, 'UDP', `PGN ${frame.pgn} len:${frame.len} #${frameCount}`);
 
         const now = Date.now();

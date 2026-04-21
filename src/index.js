@@ -8,27 +8,30 @@
 const config = require('./config/env');
 const { createLogger } = require('./services/logger');
 const { createVRA } = require('./services/vra');
+const { createMetrics } = require('./services/metrics');
 const { readJsonSafe, ensureDir } = require('./services/persist');
 const { createStore } = require('./state/store');
 const { createUdpTransport } = require('./transport/udp');
 const { createMqttTransport } = require('./transport/mqtt');
 const fs = require('fs');
 
-const { createAogModule }      = require('./modules/aog');
-const { createVistaxModule }   = require('./modules/vistax');
-const { createFlowxModule }    = require('./modules/flowx');
-const { createQuantixModule }  = require('./modules/quantix');
-const { createSectionxModule } = require('./modules/sectionx');
-const { createLinexModule }    = require('./modules/linex');
-const { createStormxModule }   = require('./modules/stormx');
+const { createAogModule }           = require('./modules/aog');
+const { createVistaxModule }        = require('./modules/vistax');
+const { createFlowxModule }         = require('./modules/flowx');
+const { createQuantixModule }       = require('./modules/quantix');
+const { createSectionxModule }      = require('./modules/sectionx');
+const { createLinexModule }         = require('./modules/linex');
+const { createStormxModule }        = require('./modules/stormx');
+const { createObservabilityModule } = require('./modules/observability');
 
 // ── 1. Bootstrap services ──────────────────────────────────────
 ensureDir(config.dataDir);
 
-const logger = createLogger(config.debug.level);
+const logger = createLogger(config.debug.level, { format: config.debug.logFormat });
 const { bus, get, set, merge, snapshot } = createStore();
 const store = { get, set, merge, snapshot, bus };
 
+const metrics = createMetrics();
 const vra = createVRA();
 
 function cargarMapa() {
@@ -45,11 +48,11 @@ logger.dbg(1, 'INIT', `MQTT:${config.mqtt.broker} | UDP:${config.udp.port} | Deb
 logger.dbg(1, 'INIT', `AOG output → ${config.udp.broadcastIp}:${config.udp.portOut} (PGN 253)`);
 
 // ── 2. Transport ───────────────────────────────────────────────
-const udp  = createUdpTransport({ port: config.udp.port, bus, logger });
-const mqtt = createMqttTransport({ brokerUrl: config.mqtt.broker, bus, logger });
+const udp  = createUdpTransport({ port: config.udp.port, bus, logger, metrics });
+const mqtt = createMqttTransport({ brokerUrl: config.mqtt.broker, bus, logger, metrics });
 
 // ── 3. Módulos AgroParallel ────────────────────────────────────
-const deps = { mqtt, bus, state: store, logger, config, udp, vra };
+const deps = { mqtt, bus, state: store, logger, config, udp, vra, metrics };
 const modules = [
     createAogModule(deps),
     createSectionxModule(deps),
@@ -58,6 +61,7 @@ const modules = [
     createQuantixModule(deps),
     createLinexModule(deps),
     createStormxModule(deps),
+    createObservabilityModule(deps),
 ];
 
 for (const mod of modules) {

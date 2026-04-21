@@ -100,12 +100,52 @@ Librería: `src/protocol/` (usada también por `tools/aog_sniffer.js` y `tools/t
 - `dotenv` ^17.3 — variables de entorno
 - `@turf/turf` ^7.3 — geoespacial (VRA)
 
+## Observabilidad
+Módulo `modules/observability/` levanta un HTTP server nativo en `HEALTH_PORT` (default 9090) con tres endpoints:
+
+| Endpoint | Formato | Contenido |
+|---|---|---|
+| `GET /healthz` | JSON | `{status, version, uptime_s, mqtt_connected, last_gps_ts, last_gps_age_ms, speed_kmh, painting, field_name, udp_frames_total}`. 200 si ok, 503 si degradado (MQTT caído o GPS >5s) |
+| `GET /metrics` | Prometheus | Counters + gauges (ver tabla abajo) |
+| `GET /version` | JSON | `{version, pid, uptime_s}` |
+
+Métricas expuestas (todas prefijadas `corex_`):
+
+| Métrica | Tipo | Labels | Fuente |
+|---|---|---|---|
+| `corex_udp_frames_total` | counter | — | transport/udp |
+| `corex_udp_frames_by_pgn_total` | counter | `pgn` | transport/udp |
+| `corex_udp_invalid_total` | counter | — | transport/udp |
+| `corex_mqtt_connects_total` | counter | — | transport/mqtt |
+| `corex_mqtt_reconnects_total` | counter | — | transport/mqtt |
+| `corex_mqtt_errors_total` | counter | — | transport/mqtt |
+| `corex_mqtt_publishes_total` | counter | — | transport/mqtt |
+| `corex_mqtt_messages_total` | counter | — | transport/mqtt |
+| `corex_mqtt_connected` | gauge | — | transport/mqtt |
+| `corex_pgn253_sent_total` | counter | — | modules/aog |
+| `corex_gps_updates_total` | counter | — | modules/aog |
+| `corex_speed_kmh` | gauge | — | modules/aog |
+| `corex_heading_deg` | gauge | — | modules/aog |
+| `corex_painting` | gauge | — | modules/aog |
+| `corex_last_gps_ts_seconds` | gauge | — | modules/aog |
+
+`HEALTH_PORT=0` asigna puerto dinámico (tests). `HEALTH_PORT=-1` deshabilita el server.
+
+## Logging estructurado
+`LOG_FORMAT=json` en `.env` hace que todos los logs salgan como un JSON por línea (`{ts, level, tag, msg, data?}`), apto para agregadores como ELK o Loki:
+```
+{"ts":"2026-04-21T12:00:00.000Z","level":"dbg","dbgLvl":1,"tag":"INIT","msg":"📡 CoreX Bridge activo"}
+```
+Default `LOG_FORMAT=text` mantiene la salida coloreada para operación interactiva.
+
 ## Tests
 `npm test` corre `node --test test/*.test.js`. Cubre:
 - `test/protocol.test.js` — encode/decode/CRC (incluye vector byte-a-byte del pcap)
 - `test/geo.test.js` — haversine + bearing + suavizado circular
 - `test/heading.test.js` — pipeline con filtrado de ruido
 - `test/vra.test.js` — lookup por punto-en-polígono
+- `test/metrics.test.js` — counters/gauges + formato Prometheus
+- `test/observability.test.js` — /healthz, /metrics, /version end-to-end
 
 ## Variables de entorno (.env)
 ```
@@ -120,6 +160,10 @@ DEBUG_LEVEL=1
 CURRENT_FIELD_PATH=          # default: ~/Documents/AgOpenGPS/current_field.json
 AOG_FIELDS_PATH=             # default: ~/Documents/AgOpenGPS/Fields
 AOGLOG_DEBUG=1               # 0 para desactivar logs verbose del watcher
+
+HEALTH_PORT=9090             # 0=OS-assigned, <0=deshabilita /healthz /metrics
+LOG_FORMAT=text              # 'text' (colores) o 'json' (structured)
+QUANTIX_SYNC_MS=30000        # intervalo sync HTTP con QuantiX
 ```
 
 ## Notas de implementación
